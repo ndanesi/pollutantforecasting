@@ -1,0 +1,210 @@
+import matplotlib
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import csv
+import datetime
+from matplotlib.dates import DateFormatter
+from statsmodels.tsa.api import ExponentialSmoothing, SimpleExpSmoothing, Holt
+import statsmodels.api as sm
+import pandas as pd
+from sklearn.metrics import mean_squared_error
+import random
+from pylab import plot, show, savefig, xlim, figure, ylim, legend, boxplot, setp, axes
+from matplotlib import patches as mpatches
+from sklearn.metrics import r2_score
+from matplotlib.lines import Line2D
+
+
+# Importing Data
+# Enter station name and year
+StationName = ""
+year = ""
+#import data file using above naming convention
+dataimport = pd.read_csv (r'C:\\Users\\User\\Downloads\\' + StationName + '-aq-' + year + '.csv')
+
+#Cleaning data and setting a timeseries index
+dataimport = dataimport.dropna()
+dataimport['Datetime'] = dataimport['Date'].str.cat(dataimport['Time'],sep=" ")
+time = dataimport['Datetime'].astype('datetime64')
+
+
+no_of_experiments = 50                # ENTER number of experiments to conduct
+lead_time = 7                         # ENTER lead time
+rsmelist = []
+box_holt = []
+box_naive = []
+box_avg = []
+abserror_list = []
+abserror_listpercent = []
+horizontal_stack_add =  pd.DataFrame()
+concentration = ''                     # ENTER pollutant here including units
+
+df =  pd.DataFrame(data=dataimport, columns=['Datetime', concentration]).set_index(['Datetime'])
+
+
+for x in range(1, 2):
+
+    lead_time = lead_time + 1
+
+    for _ in range(no_of_experiments):
+            
+        start_index = random.randint(1000,8000) #number of h ours, may require to be changed depending on data avaliable  (to generate the second example)
+        train= df[start_index:start_index+1000]
+        test= df[start_index+1000:start_index+1000+lead_time]
+            
+        y_hat_avg = test.copy()
+        print ('computation started')
+        fit1 = ExponentialSmoothing(np.asarray(train[concentration]) ,seasonal_periods=24 ,trend='add', seasonal='add',).fit()
+        y_hat_avg['Holt_Winter'] = fit1.forecast(len(test))
+        print ('computation completed')
+        y_hat_avg['Holt_Winter'] = [1 if i < 0 else i for i in  y_hat_avg['Holt_Winter']]
+        
+        # persistence
+        last_value = train[concentration][-1]
+        y_hat_avg['naive'] = last_value * np.ones(len(test))
+        
+        a = y_hat_avg[concentration]
+        b = y_hat_avg['naive']
+        rmse_value_persistence = np.sqrt(np.mean((b - a) ** 2))
+
+        # average
+        mean_training_value = np.mean(train[concentration])
+        y_hat_avg['aver'] = mean_training_value*np.ones(len(test))
+        
+        a = y_hat_avg[concentration]
+        b = y_hat_avg['aver']
+        rmse_value_avg = np.sqrt(np.mean((b - a) ** 2))
+      
+        horizontal_stack_add = horizontal_stack_add.append(y_hat_avg.tail(1))
+        
+        mse = mean_squared_error(y_hat_avg[concentration],y_hat_avg['Holt_Winter'])
+        rsme = np.sqrt(mse)
+        print(rsme)
+        box_holt.append([lead_time,rsme])
+        box_naive.append([lead_time,rmse_value_persistence])
+        box_avg.append([lead_time,rmse_value_avg])        
+        rsmelist.append([lead_time,rsme,rmse_value_persistence,rmse_value_avg])
+        
+
+dfRSME = pd.DataFrame(rsmelist,columns=['Lead time','RSME','RSME_naive','RSME_avg'])
+stack = (dfRSME.set_index(['Lead time']).stack().reset_index(name='Value').rename(columns={'level__2':'Dim'}))
+dfRSME_Summ = stack.groupby(['Lead time','level_1'])['Value'].mean()
+dfRSME_Summ = dfRSME_Summ.to_frame()
+dfRSME_T = dfRSME_Summ.pivot_table('Value',['level_1'],'Lead time')
+print(dfRSME_T)
+
+horizontal_stack_add_fuck = horizontal_stack_add.set_index(pd.to_datetime(horizontal_stack_add.index))
+
+
+### Old Boxplot graphs ###
+
+# plt.figure(1)
+# box_colors = ['darkkhaki', 'royalblue']
+df_holt = pd.DataFrame(box_holt,columns=['Lead time','Holt'])
+df_holt = df_holt.pivot(index=None, columns = 'Lead time')
+# boxplot_holt = df_holt.boxplot(showmeans=True,patch_artist=True,boxprops=dict(facecolor="red", color="red"))
+# # plt.figure(2)
+df_naive = pd.DataFrame(box_naive,columns=['Lead time','Naive'])
+df_naive = df_naive.pivot(index=None, columns = 'Lead time')
+# boxplot_naive = df_naive.boxplot(showmeans=True,patch_artist=True,boxprops=dict(facecolor="blue", color="blue"))
+# # plt.figure(3)
+df_avg = pd.DataFrame(box_avg,columns=['Lead time','Avg'])
+df_avg = df_avg.pivot(index=None, columns = 'Lead time')
+# boxplot_avg = df_avg.boxplot(showmeans=True,patch_artist=True,boxprops=dict(facecolor="green", color="green"))
+# # plt.xticks([1, 2, 3, 4,5,6,7,8,9,10,11,12,13,14,15,16,17,18], ['', 'One', '','','Two','','','Three','','','Four','','','Five','','','Six',''])
+
+# sp_name = ['Holt Winter', 'Persistence', 'Average']
+# setosa = mpatches.Patch(color='red')
+# versi = mpatches.Patch(color='blue')
+# virgi = mpatches.Patch(color='green')
+
+
+# plt.legend(title='Test', labels=sp_name,
+#            handles=[setosa, versi, virgi], bbox_to_anchor=(1, 1.16),
+#            fancybox=True, shadow=True, ncol=5, loc='best')
+# plt.xlabel('Lead time (Hours)', fontsize=10)
+# plt.ylabel('RSME - Ozone (ppb)', fontsize=14)
+# plt.title('Lead time vs RSME')
+
+
+
+## Stacked boxplot graphs ###
+
+fig, axes = plt.subplots(nrows=2, ncols=2) # create 2x2 array of subplots
+df_holt.boxplot(showmeans=True,meanprops={"markerfacecolor":"black"},patch_artist=True,boxprops=dict(facecolor="red", color="red"), ax=axes[0,0]) # add boxplot to 1st subplot
+df_naive.boxplot(showmeans=True,meanprops={"markerfacecolor":"black"},patch_artist=True,boxprops=dict(facecolor="blue", color="blue"), ax=axes[0,1]) # add boxplot to 2nd subplot
+df_avg.boxplot(showmeans=True,meanprops={"markerfacecolor":"black"},patch_artist=True,boxprops=dict(facecolor="green", color="green"), ax=axes[1,0])
+fig.delaxes(axes[1,1])
+# Defining custom 'xlim' and 'ylim' values.
+custom_xlim = (0, 7)
+custom_ylim = (0, 16)
+
+# Setting the values for all axes.
+plt.setp(axes, xlim=custom_xlim, ylim=custom_ylim)
+
+sp_name = ['Holt Winter', 'Persistence', 'Average', 'Mean','Outliers']
+setosa = mpatches.Patch(color='red')
+versi = mpatches.Patch(color='blue')
+virgi = mpatches.Patch(color='green')
+
+red_circle = Line2D([0], [0], marker='^', color='w', label='Circle',
+                        markerfacecolor='black', markersize=8)
+black_circle = Line2D([0], [0], marker='o',markeredgecolor='black', color='w', label='Circle',
+                        markerfacecolor='w', markersize=8)
+
+fig.legend(title='Model', labels=sp_name,
+            handles=[setosa, versi, virgi,red_circle,black_circle],
+            fancybox=True, shadow=True, ncol=1, loc='lower right', bbox_to_anchor=(0.8, 0.15))
+
+
+fig.text(0.5, 0.04, 'Lead time (Hours)', ha='center')
+fig.text(0.03, 0.5, 'RMSE - Nitrogen Dioxide concentrations (ppb)', va='center', rotation='vertical')
+fig.text(0.5, 0.92, 'RMSE vs lead time by model', ha='center')
+plt.setp(axes, xticklabels=['1', '2', '3','4','5','6'])
+plt.show()
+# plt.savefig('NO2 4 boxplotsperf.png')
+
+
+## Concentration over time graph ###
+
+horizontal_stack_add_fuck = horizontal_stack_add_fuck.sort_index()
+fig = plt.figure(2, figsize=(9,4))
+plt.plot(horizontal_stack_add_fuck[concentration], 'black', label='Actual')
+plt.plot(horizontal_stack_add_fuck['Holt_Winter'], 'r', label='Holt Winter')
+plt.plot(horizontal_stack_add_fuck['naive'], 'b--', label='Persistence')
+plt.plot(horizontal_stack_add_fuck['aver'], 'g:', label='Average')
+plt.legend(loc='best', fontsize=12)
+plt.tick_params(
+    axis='x',          # changes apply to the x-axis
+    which='both',      # both major and minor ticks are affected
+    bottom=True,      # ticks along the bottom edge are off
+    top=False,         # ticks along the top edge are off
+    labelbottom=True) # labels along the bottom edge are off
+plt.xlabel('Time', fontsize=10)
+plt.ylabel("PM$_2$.$_5$ concentrations (ug/m$^3$)", fontsize=10)
+plt.title('Timeseries: Predicted and observed PM$_2$.$_5$ values')
+plt.tight_layout()
+# plt.savefig('PM2.5 overtime.png')
+
+
+
+## Scatterplot of observed vs actuals ###
+
+fig4 = plt.figure(3, figsize=(4,4))
+plt.scatter(horizontal_stack_add[concentration], horizontal_stack_add['Holt_Winter'],color='red')
+m, b = np.polyfit(horizontal_stack_add[concentration], horizontal_stack_add['Holt_Winter'], 1)
+plt.plot(horizontal_stack_add[concentration], m*horizontal_stack_add[concentration] + b,color='black')
+r2 = str(round(r2_score(horizontal_stack_add[concentration], horizontal_stack_add['Holt_Winter']),2))
+ax = fig4.add_subplot()
+fig4.subplots_adjust(top=0.85)
+plt.text(4, 27, "Leadtime: 8 hr, R$^2$ = " + r2, style='italic',
+        bbox={'facecolor': 'red', 'alpha': 0.5, 'pad': 6})
+plt.xlabel('Observed NO$_2$ concentrations (ppb)', fontsize=10)
+plt.ylabel('Predicted NO$_2$ concentrations (ppb)', fontsize=10)
+plt.title('Predicted and observed NO$_2$ values')
+plt.xlim([0, 30])
+plt.ylim([0, 30])
+plt.tight_layout()
+# plt.savefig('NO2 Northward 8 hr.png')
+
