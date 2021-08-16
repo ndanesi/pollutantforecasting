@@ -1,0 +1,47 @@
+"""
+Created on Sat Mar 6 10:03:45 2021
+
+@author: Nicholas Danesi
+
+"""
+
+from selenium import webdriver
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver import Chrome
+from selenium.common.exceptions import NoSuchElementException
+
+MySPath = 'C:/Users/User/Downloads/chromedriver_win32/chromedriver'
+
+url = 'https://www.data.qld.gov.au/'
+search_str = 'Air quality monitoring'
+
+driver = Chrome(executable_path=MySPath)
+driver.get(url)
+driver.find_element_by_xpath("/html/body/div/div[3]/div[1]/div/div[2]/form/input").send_keys(search_str)
+driver.find_element_by_xpath("/html/body/div/div[3]/div[1]/div/div[2]/form/button").click()
+driver.find_element_by_xpath("/html/body/div[3]/div/div[3]/div/section[1]/div[1]/form/h2").text
+
+result_val = driver.find_element_by_xpath("/html/body/div[3]/div/div[3]/div/section[1]/div[1]/form/h2").text
+result_val = int(result_val.split(' ')[0])
+page_cnt = int(round(result_val/20)+1)
+
+curr_url = driver.current_url 
+
+#pull Air quality monitoring from the years 2015-2019, it is possible to add additional years to pull addtional
+myList = ['Air Quality Monitoring - 2015','Air Quality Monitoring - 2016','Air Quality Monitoring - 2017', 'Air Quality Monitoring - 2018','Air Quality Monitoring - 2019']
+
+for x in range(1,page_cnt):
+    go_url = curr_url + '&page=' + str(x)
+    driver.get(go_url)
+    for y in range(0,len(driver.find_elements_by_class_name("dataset-item"))):
+        if driver.find_elements_by_class_name("dataset-item")[y].find_element_by_class_name("dataset-heading").text in myList:
+            driver.get(driver.find_elements_by_class_name("dataset-item")[y].find_element_by_class_name("dataset-heading").find_element_by_tag_name("a").get_attribute("href"))
+            #driver.find_elements_by_class_name("dataset-item")[1].find_element_by_class_name("dataset-heading").click()
+            for z in range(0,len(driver.find_elements_by_class_name("resource-item"))):
+                driver.get(driver.find_elements_by_class_name("resource-item")[z].find_element_by_tag_name("a").get_attribute("href"))
+                driver.get(driver.find_element_by_class_name("resource-url-analytics").get_attribute("href"))
+                driver.back()
+        driver.get(go_url)
+    
+
+driver.quit()
