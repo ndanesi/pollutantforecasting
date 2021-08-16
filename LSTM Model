@@ -1,0 +1,430 @@
+from google.colab import drive
+drive.mount('/content/drive')
+%tensorflow_version 2.x
+import tensorflow as tf
+print("Tensorflow version " + tf.__version__)
+
+try:
+  tpu = tf.distribute.cluster_resolver.TPUClusterResolver()  # TPU detection
+  print('Running on TPU ', tpu.cluster_spec().as_dict()['worker'])
+except ValueError:
+  raise BaseException('ERROR: Not connected to a TPU runtime; please see the previous cell in this notebook for instructions!')
+
+tf.config.experimental_connect_to_cluster(tpu)
+tf.tpu.experimental.initialize_tpu_system(tpu)
+tpu_strategy = tf.distribute.experimental.TPUStrategy(tpu)
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.io
+from scipy.stats import pearsonr, boxcox
+from scipy.special import inv_boxcox
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from copy import copy, deepcopy
+import math
+import datetime
+import sys
+sys.path.append('/content/drive/My Drive/Colab Notebooks/Pollutant Forecasting - Australia')
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM
+
+dataColumnName = 'Ozone (ppm)' # Column name to forecast
+secondsGap = 3600 # Minimum and expected gap between two consecutive time steps in the data
+historySteps = 72 # History time steps which will be considered to make a forecast
+leadSteps = 4 # Lead time steps for which the forecast is to be made
+continuousPrediction = False # If we need to make a continous prediction from last historical value to the leadSteps OR just need to predict the value at leadStep
+randomState = 51 # Random State to make results deterministic upon different runs
+
+batchSize = 128 # Batch size for Tensorflow Model Training
+NBepochs = 180 # Number of epochs for Tensorflow Model Training
+
+# Number of rows to drop from the end of the data
+n = 1500
+
+# Data Paths
+dataPath = '/content/drive/My Drive/Colab Notebooks/Pollutant Forecasting - Australia/data/rocklea-aggregated-2019.csv'
+
+# Model Information Paths
+modelPath = '/content/drive/My Drive/Colab Notebooks/Pollutant Forecasting - Australia/models/'
+
+# Reading and Preprocessing data
+
+dataimport = pd.read_csv(dataPath)
+
+#dataimport = dataimport.dropna()
+dataimport['Datetime'] = dataimport['Date'].str.cat(dataimport['Time'],sep=" ")
+time = dataimport['Datetime'].astype('datetime64')
+
+# Timeseries dataframe for all meteorlogical/pollutant variables
+
+df_dataimport = pd.DataFrame(data=dataimport, columns=['Datetime','Visibility-reducing Particles (Mm^-1)','Wind Direction (degTN)','Wind Speed (m/s)','Air Temperature (degC)','Relative Humidity (%)','Rainfall (mm)','Barometric Pressure (hPa)','Solar radiation (w/m^2)','Ozone (ppm)','Nitrogen Dioxide (ppm)','PM10 (ug/m^3)','PM2.5 (ug/m^3)']).set_index(['Datetime'])
+
+# Timeseries dataframe for PM2.5 concentrations
+
+df =  pd.DataFrame(data=dataimport, columns=['Datetime', dataColumnName])#.set_index(['Datetime'])
+ 
+# Dropping last n rows using drop
+df.drop(df.tail(n).index, inplace = True)
+
+# Check continuity
+def check_continuity_TS(dataframe, timeColumn, secondsGap):
+    prev_value = 0
+    contflag = True
+    for key, value in dataframe[timeColumn].iteritems():
+        if not prev_value==0:
+            time_diff = (pd.to_datetime(value, dayfirst=True) - pd.to_datetime(prev_value, dayfirst=True)).total_seconds()
+            if not time_diff == secondsGap:
+                print('Found error at key =', key, 'and time_diff =', time_diff)
+                print('value = ', value, '; prev_value = ', prev_value)
+                contflag = False
+            prev_value = value
+    return contflag
+
+print(check_continuity_TS(df, 'Datetime', secondsGap))
+
+#set negative values to zero
+
+print(df[dataColumnName].min())
+df.loc[:,(dataColumnName)].where(df.loc[:,(dataColumnName)] > 0, other = 0, inplace = True)
+print(df[dataColumnName].min())
+
+#plot raw data
+
+plt.rc('font', size=15)         # controls default text sizes
+plt.rc('axes', titlesize=17)    # fontsize of the axes title
+plt.rc('axes', labelsize=17)    # fontsize of the x and y labels
+plt.rc('xtick', labelsize=15)   # fontsize of the tick labels
+plt.rc('ytick', labelsize=15)   # fontsize of the tick labels
+plt.rc('legend', fontsize=15)   # legend fontsize
+plt.rc('figure', titlesize=20)  # fontsize of the figure title
+df.plot(x='Datetime', y=dataColumnName, figsize=(20, 12), label='PM$_2$.$_5$ ($\mu$g/m$^3$)')
+plt.legend(loc='best', fontsize=15)
+plt.xlabel('DateTime', fontsize=18)
+plt.ylabel("PM$_2$.$_5$ concentrations ($\mu$g/m$^3$)", fontsize=18)
+plt.title('Timeseries: Observed PM$_2$.$_5$ values over time - Rocklea')
+plt.show()
+
+#plot histogram
+
+plt.rc('font', size=15)         # controls default text sizes
+plt.rc('axes', titlesize=18)    # fontsize of the axes title
+plt.rc('axes', labelsize=18)    # fontsize of the x and y labels
+plt.rc('xtick', labelsize=15)   # fontsize of the tick labels
+plt.rc('ytick', labelsize=15)   # fontsize of the tick labels
+plt.rc('legend', fontsize=15)   # legend fontsize
+plt.rc('figure', titlesize=20)  # fontsize of the figure title
+df.plot.hist(by='PM2.5 ($\mu$g/m$^3$)', bins=50, figsize=(20, 12))
+
+#Perform Boxcox transformation
+
+def boxcox_withZeroes(data):
+    posdata = data[data > 0]
+    bcData, bcLambda = boxcox(posdata)
+    if bcLambda<=0:
+        raise('Unable to perform Box-Cox transformation!')
+    else:
+        bcDataFinal = np.empty_like(data)
+        bcDataFinal[data > 0] = bcData
+        bcDataFinal[data == 0] = -1/bcLambda
+    return bcDataFinal, bcLambda
+
+def inv_boxcox_withZeroes(bcData, bcLambda):
+    data = np.empty_like(bcData)
+    data[bcData == -1/bcLambda] = 0
+    data[bcData != -1/bcLambda] = inv_boxcox(bcData[bcData != -1/bcLambda], bcLambda)
+    return data
+
+def boxcox1p(data, lmbda=None):
+    p1data = data + 1
+    if lmbda is None:
+        bcData, bcLambda = boxcox(p1data)
+        return bcData, bcLambda
+    else:
+        bcData = boxcox(p1data, lmbda)
+        return bcData
+
+def inv_boxcox1p(bcData, bcLambda):
+    data = inv_boxcox(bcData, bcLambda) - 1
+    #if not bcLambda==0:
+    #    data = np.exp(np.log((bcData*bcLambda)+1)/bcLambda)
+    #else:
+    #    data = np.exp(bcData)
+    return data
+
+bcData, bcLambda = boxcox1p(df[dataColumnName].dropna())
+'''
+plt.figure(figsize=(20, 12))
+plt.rc('font', size=15)         # controls default text sizes
+plt.rc('axes', titlesize=18)    # fontsize of the axes title
+plt.rc('axes', labelsize=18)    # fontsize of the x and y labels
+plt.rc('xtick', labelsize=15)   # fontsize of the tick labels
+plt.rc('ytick', labelsize=15)   # fontsize of the tick labels
+plt.rc('legend', fontsize=15)   # legend fontsize
+plt.rc('figure', titlesize=20)  # fontsize of the figure title
+plt.hist(bcData, bins=50)
+print(bcLambda)
+
+oriData = inv_boxcox1p(bcData, bcLambda)
+plt.figure(figsize=(20, 12))
+plt.rc('font', size=15)         # controls default text sizes
+plt.rc('axes', titlesize=18)    # fontsize of the axes title
+plt.rc('axes', labelsize=18)    # fontsize of the x and y labels
+plt.rc('xtick', labelsize=15)   # fontsize of the tick labels
+plt.rc('ytick', labelsize=15)   # fontsize of the tick labels
+plt.rc('legend', fontsize=15)   # legend fontsize
+plt.rc('figure', titlesize=20)  # fontsize of the figure title
+plt.hist(oriData, bins=50)
+print(bcLambda)
+'''
+#Perform data standardisation
+
+scaler = StandardScaler()
+tempData = bcData.reshape(-1,1)
+scaler.fit(tempData)
+scaled_bcData = scaler.transform(tempData)[:,0]
+
+plt.figure(figsize=(20, 12))
+plt.rc('font', size=15)         # controls default text sizes
+plt.rc('axes', titlesize=18)    # fontsize of the axes title
+plt.rc('axes', labelsize=18)    # fontsize of the x and y labels
+plt.rc('xtick', labelsize=15)   # fontsize of the tick labels
+plt.rc('ytick', labelsize=15)   # fontsize of the tick labels
+plt.rc('legend', fontsize=15)   # legend fontsize
+plt.rc('figure', titlesize=20)  # fontsize of the figure title
+plt.hist(scaled_bcData, bins=50)
+
+#Split training and test data
+
+def make_windows_univariate(dataframe, columnName, historySteps, leadSteps, continuousPrediction=False):
+    X = np.empty((0,historySteps), float)
+    if continuousPrediction:
+        Y = np.empty((0,leadSteps), float)
+    else:
+        Y = np.empty((0,1), float)
+    for key, value in dataframe[columnName].iteritems():
+        if key+historySteps+leadSteps > len(dataframe.index)-1:
+            break
+        if continuousPrediction:
+            if sum(pd.isnull(dataframe[columnName][key:key+historySteps+leadSteps])) > 0 and  not pd.isnull(dataframe[columnName][key+historySteps+leadSteps]):
+                continue
+            else:
+                X = np.append(X, np.array([dataframe[columnName][key:key+historySteps]]), axis=0)
+                Y = np.append(Y, np.array([dataframe[columnName][key+historySteps:key+historySteps+leadSteps]]), axis=0)
+        else:
+            if sum(pd.isnull(dataframe[columnName][key:key+historySteps])) > 0:
+                continue
+            else:
+                X = np.append(X, np.array([dataframe[columnName][key:key+historySteps]]), axis=0)
+                Y = np.append(Y, np.array([[dataframe[columnName][key+historySteps+leadSteps-1]]]), axis=0)
+    return X,Y
+
+X,Y = make_windows_univariate(df, dataColumnName, historySteps, leadSteps, continuousPrediction)
+print(X.shape, Y.shape)
+
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=randomState, shuffle=False)
+print(X_train.shape, Y_train.shape)
+print(X_test.shape, Y_test.shape)
+
+#perform box-cox transformation followed by standard scaling on the windowed train and test sets
+
+def boxcoxNstandardize(data, lmbda, scaler):
+    data_bc = np.empty_like(data)
+    data_bcScaled = np.empty_like(data)
+    for row in range(data.shape[1]):
+        data_bc[:,row] = boxcox1p(data[:,row], lmbda=lmbda)
+        data_bcScaled[:,row] = scaler.transform(data_bc[:,row].reshape(-1,1))[:,0]
+    return data_bcScaled
+X_train_bcScaled = boxcoxNstandardize(X_train, bcLambda, scaler)
+print(X_train_bcScaled.shape)
+Y_train_bcScaled = boxcoxNstandardize(Y_train, bcLambda, scaler)
+print(Y_train_bcScaled.shape)
+X_test_bcScaled = boxcoxNstandardize(X_test, bcLambda, scaler)
+print(X_test_bcScaled.shape)
+Y_test_bcScaled = boxcoxNstandardize(Y_test, bcLambda, scaler)
+print(Y_test_bcScaled.shape)
+
+#Start LSTM Declaration and Training
+
+trainX = deepcopy(X_train_bcScaled)
+trainY = deepcopy(Y_train_bcScaled)
+testX = deepcopy(X_test_bcScaled)
+testY = deepcopy(Y_test_bcScaled)
+
+tf.keras.backend.clear_session()
+tf.random.set_seed(randomState)
+np.random.seed(randomState)
+print("Before Reshaping")
+print(trainX.shape)
+print(trainY.shape)
+print(testX.shape)
+print(testY.shape)
+
+# Reshape Input to be [Samples, Time-Steps, Features]
+trainX = np.reshape(trainX, (trainX.shape[0], trainX.shape[1], 1))
+testX = np.reshape(testX, (testX.shape[0], testX.shape[1], 1))
+print("After Reshaping")
+print(trainX.shape)
+print(trainY.shape)
+print(testX.shape)
+print(testY.shape)
+
+# Create and Fit the LSTM Network
+model = Sequential()
+model.add(LSTM(32, input_shape=(historySteps, 1), activation='tanh', return_sequences=True))
+model.add(LSTM(32, activation='tanh'))
+model.add(Dense(16, activation='relu'))
+model.add(Dense(1))
+
+lr_schedule = tf.keras.callbacks.LearningRateScheduler(
+    lambda epoch: 1e-4 * 10**(epoch / 20))
+adam = tf.keras.optimizers.Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999, amsgrad=False)
+checkpointer = tf.keras.callbacks.ModelCheckpoint(filepath=modelPath+"LRadjustment/weights.hdf5", monitor="loss", verbose=0, save_best_only=True, save_weights_only=True)
+model.compile(loss="huber_loss",
+              optimizer=adam,
+              metrics=["mean_squared_error"])
+print(model.summary())
+
+print("Starting to fit")
+history = model.fit(trainX, trainY, epochs=100, batch_size=batchSize, verbose=1, callbacks=[lr_schedule, checkpointer])
+model.load_weights(modelPath+'LRadjustment/weights.hdf5')
+
+plt.figure(figsize=(10, 6))
+plt.rc('font', size=20)         # controls default text sizes
+plt.rc('axes', titlesize=22)    # fontsize of the axes title
+plt.rc('axes', labelsize=22)    # fontsize of the x and y labels
+plt.rc('xtick', labelsize=20)   # fontsize of the tick labels
+plt.rc('ytick', labelsize=20)  # fontsize of the tick labels
+plt.rc('legend', fontsize=22)   # legend fontsize
+plt.rc('figure', titlesize=23)  # fontsize of the figure title
+plt.semilogx(history.history["lr"], history.history["loss"])
+plt.axis([1e-4, 1e+1, 0.15, 0.25])
+plt.xlabel('Learning Rate')
+plt.ylabel('Loss')
+
+trainX = deepcopy(X_train_bcScaled)
+trainY = deepcopy(Y_train_bcScaled)
+testX = deepcopy(X_test_bcScaled)
+testY = deepcopy(Y_test_bcScaled)
+
+tf.keras.backend.clear_session()
+tf.random.set_seed(randomState)
+np.random.seed(randomState)
+print("Before Reshaping")
+print(trainX.shape)
+print(trainY.shape)
+print(testX.shape)
+print(testY.shape)
+
+# Reshape Input to be [Samples, Time-Steps, Features]
+trainX = np.reshape(trainX, (trainX.shape[0], trainX.shape[1], 1))
+testX = np.reshape(testX, (testX.shape[0], testX.shape[1], 1))
+print("After Reshaping")
+print(trainX.shape)
+print(trainY.shape)
+print(testX.shape)
+print(testY.shape)
+
+# Create and Fit the LSTM Network
+model = Sequential()
+model.add(LSTM(32, input_shape=(historySteps, 1), activation='tanh', return_sequences=True))
+model.add(LSTM(32, activation='tanh'))
+model.add(Dense(16, activation='relu'))
+model.add(Dense(1))
+
+lr_schedule = tf.keras.callbacks.LearningRateScheduler(
+    lambda epoch: 1e-4 * 10**(epoch / 20) if (1e-4 * 10**(epoch / 20)<1e-2) else 8e-3)
+adam = tf.keras.optimizers.Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999, amsgrad=False)
+checkpointer = tf.keras.callbacks.ModelCheckpoint(filepath=modelPath+"MainTraining/weights.hdf5", monitor="loss", verbose=0, save_best_only=True, save_weights_only=True)
+model.compile(loss="huber_loss",
+              optimizer=adam,
+              metrics=["mean_squared_error"])
+print(model.summary())
+
+print("Starting to fit")
+history = model.fit(trainX, trainY, epochs=NBepochs, batch_size=batchSize, verbose=1, callbacks=[lr_schedule, checkpointer])
+model.load_weights(modelPath+'MainTraining/weights.hdf5')
+
+plt.figure(figsize=(10, 6))
+plt.rc('font', size=20)         # controls default text sizes
+plt.rc('axes', titlesize=22)    # fontsize of the axes title
+plt.rc('axes', labelsize=22)    # fontsize of the x and y labels
+plt.rc('xtick', labelsize=20)   # fontsize of the tick labels
+plt.rc('ytick', labelsize=20)  # fontsize of the tick labels
+plt.rc('legend', fontsize=22)   # legend fontsize
+plt.rc('figure', titlesize=23)  # fontsize of the figure title
+plt.plot(np.arange(NBepochs)+1, history.history["loss"], 'r--')
+#plt.axis([1e-4, 1e+1, 0.09, 0.25])
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+
+lstmForecast_train = model.predict(trainX)
+print(lstmForecast_train.shape)
+
+lstmForecast_test = model.predict(testX)
+print(lstmForecast_test.shape)
+
+def inv_boxcoxNstandardize(data_bcScaled, lmbda, scaler):
+    if len(data_bcScaled.shape)==3:
+        data_bcScaled = data_bcScaled.reshape(data_bcScaled.shape[0], data_bcScaled.shape[1])
+    data_bc = np.empty_like(data_bcScaled)
+    data = np.empty_like(data_bcScaled)
+    for row in range(data.shape[1]):
+        data_bc[:,row] = scaler.inverse_transform(data_bcScaled[:,row].reshape(-1,1)).reshape(-1)
+        data[:,row] = inv_boxcox1p(data_bc[:,row], lmbda)
+    return data
+
+true_trainX = inv_boxcoxNstandardize(X_train_bcScaled, bcLambda, scaler)
+true_trainY = inv_boxcoxNstandardize(Y_train_bcScaled, bcLambda, scaler)
+forecasted_trainY = inv_boxcoxNstandardize(lstmForecast_train, bcLambda, scaler)
+naive_trainY = true_trainX[:, -1].reshape(-1,1)
+print(true_trainX.shape, true_trainY.shape, forecasted_trainY.shape, naive_trainY.shape)
+
+true_testX = inv_boxcoxNstandardize(X_test_bcScaled, bcLambda, scaler)
+true_testY = inv_boxcoxNstandardize(Y_test_bcScaled, bcLambda, scaler)
+forecasted_testY = inv_boxcoxNstandardize(lstmForecast_test, bcLambda, scaler)
+naive_testY = true_testX[:, -1].reshape(-1,1)
+print(true_testX.shape, true_testY.shape, forecasted_testY.shape, naive_testY.shape)
+
+print('RMSE for LSTM Model (Train Set) = ', mean_squared_error(true_trainY, forecasted_trainY, squared=False))
+print('RMSE for Naive Forecast (Train Set) = ', mean_squared_error(true_trainY, naive_trainY, squared=False))
+
+print('RMSE for LSTM Model (Test Set) = ', mean_squared_error(true_testY, forecasted_testY, squared=False))
+print('RMSE for Naive Forecast (Test Set) = ', mean_squared_error(true_testY, naive_testY, squared=False))
+
+plt.figure(figsize=(10, 6))
+plt.rc('font', size=20)         # controls default text sizes
+plt.rc('axes', titlesize=22)    # fontsize of the axes title
+plt.rc('axes', labelsize=22)    # fontsize of the x and y labels
+plt.rc('xtick', labelsize=20)   # fontsize of the tick labels
+plt.rc('ytick', labelsize=20)  # fontsize of the tick labels
+plt.rc('legend', fontsize=22)   # legend fontsize
+plt.rc('figure', titlesize=23)  # fontsize of the figure title
+time = np.arange(3100,3150)
+plt.plot(time,true_trainY[time])
+plt.plot(time,forecasted_trainY[time])
+plt.plot(time,naive_trainY[time])
+plt.xlabel("Time")
+plt.ylabel("Value")
+plt.legend(("Actual Data","Forecasted Data", "Naive Predictions"))
+plt.grid(True)
+
+plt.figure(figsize=(10, 6))
+plt.rc('font', size=20)         # controls default text sizes
+plt.rc('axes', titlesize=22)    # fontsize of the axes title
+plt.rc('axes', labelsize=22)    # fontsize of the x and y labels
+plt.rc('xtick', labelsize=20)   # fontsize of the tick labels
+plt.rc('ytick', labelsize=20)  # fontsize of the tick labels
+plt.rc('legend', fontsize=22)   # legend fontsize
+plt.rc('figure', titlesize=23)  # fontsize of the figure title
+time = np.arange(3100,3150)
+plt.plot(time,true_testY[time])
+plt.plot(time,forecasted_testY[time])
+plt.plot(time,naive_testY[time])
+plt.xlabel("Time")
+plt.ylabel("Value")
+plt.legend(("Actual Data","Forecasted Data", "Naive Predictions"))
+plt.grid(True)
